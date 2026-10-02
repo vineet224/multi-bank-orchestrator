@@ -1,22 +1,17 @@
 {
-  "name": "multi-bank-orchestrator",
+  "name": "multi-bank-system",
   "version": "1.0.0",
-  "description": "Multi-Bank Orchestrator Service with In-Memory Storage",
-  "main": "src/server.js",
+  "private": true,
   "type": "module",
+  "workspaces": [
+    "auth-service",
+    "orchestrator-service"
+  ],
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "test": "node --test"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "cors": "^2.8.6",
-    "dotenv": "^18.0.5",
-    "express": "^5.2.1",
-    "morgan": "^1.12.1",
-    "uuid": "^14.0.2"
+    "dev": "node scripts/dev.js",
+    "dev:auth": "npm --workspace=auth-service run dev",
+    "dev:orchestrator": "npm --workspace=orchestrator-service run dev",
+    "start:auth": "npm --workspace=auth-service start",
+    "start:orchestrator": "npm --workspace=orchestrator-service start"
   }
 }
