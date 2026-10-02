@@ -16,7 +16,8 @@ app.get('/health', (req, res) => {
   res.json({ service: 'auth-service', status: 'UP', port: PORT });
 });
 
-// Mount routes
+// Mount auth routes (standard v1 and shortcut)
+app.use('/api/v1/auth', authRoutes);
 app.use('/auth', authRoutes);
 
 app.listen(PORT, () => {

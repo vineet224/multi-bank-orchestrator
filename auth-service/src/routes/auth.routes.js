@@ -1,10 +1,23 @@
 import { Router } from 'express';
-import { register, login, verify } from '../controllers/auth.controller.js';
+import {
+  registerClient,
+  login,
+  validateOpaqueToken,
+  revoke,
+} from '../controllers/authController.js';
 
 const router = Router();
 
-router.post('/register', register);
+// Onboard enterprise client
+router.post('/clients', registerClient);
+
+// Issue high-entropy opaque bearer token
 router.post('/login', login);
-router.get('/verify', verify);
+
+// Authoritative inspection endpoint with optional piggybacked billing
+router.post('/validate-opaque-token', validateOpaqueToken);
+
+// Administrative session kill switch
+router.post('/revoke', revoke);
 
 export default router;
