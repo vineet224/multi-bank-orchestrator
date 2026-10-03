@@ -32,8 +32,16 @@ export const authenticateRequest = async (req, res, next) => {
   // 2. Dequeue pending billing receipt (if available) to piggyback onto auth hop
   const pendingReceipt = orchestratorStore.dequeueNextBillingReceipt();
 
+  // 3. Determine workflow action for Active Concurrent Capacity licensing
+  let workflowAction = 'INSPECT';
+  if (req.method === 'POST' && req.path.includes('/issuance/')) {
+    workflowAction = 'INITIATE_WORKFLOW';
+  } else if (req.method === 'POST' && req.path.includes('/presentation/')) {
+    workflowAction = 'TERMINATE_WORKFLOW';
+  }
+
   try {
-    // 3. Intentional Network Hop to Auth Service (Port 4000)
+    // 4. Intentional Network Hop to Auth Service (Port 4000)
     const authResponse = await fetch(`${AUTH_SERVICE_URL}/api/v1/auth/validate-opaque-token`, {
       method: 'POST',
       headers: {
@@ -42,6 +50,7 @@ export const authenticateRequest = async (req, res, next) => {
         'X-Orchestrator-Node-Id': NODE_ID,
       },
       body: JSON.stringify({
+        workflow_action: workflowAction,
         ...(pendingReceipt && { piggybacked_billing_receipt: pendingReceipt }),
       }),
     });
@@ -57,7 +66,7 @@ export const authenticateRequest = async (req, res, next) => {
 
     const authData = await authResponse.json();
 
-    // 4. Inspect token_status returned by RFC 7662 introspection
+    // 5. Inspect token_status returned by RFC 7662 introspection
     if (authData.token_status !== 'VALID') {
       // Re-queue receipt if token was invalid
       if (pendingReceipt) orchestratorStore.enqueueBillingReceipt(pendingReceipt);
@@ -75,7 +84,7 @@ export const authenticateRequest = async (req, res, next) => {
       });
     }
 
-    // 5. Verify subscription context is active
+    // 6. Verify subscription context is active
     if (authData.subscription_context?.status !== 'ACTIVE') {
       if (pendingReceipt) orchestratorStore.enqueueBillingReceipt(pendingReceipt);
       return res.status(403).json({
@@ -84,11 +93,23 @@ export const authenticateRequest = async (req, res, next) => {
       });
     }
 
-    // 6. Bind authoritative context to request object
+    // 7. Active Concurrent Capacity Licensing Guard
+    if (authData.capacity_status === 'CAPACITY_LIMIT_EXCEEDED') {
+      if (pendingReceipt) orchestratorStore.enqueueBillingReceipt(pendingReceipt);
+      return res.status(429).json({
+        error: 'capacity_limit_exceeded',
+        message: `Active concurrent capacity limit (${authData.subscription_context?.max_concurrent_workflows}) reached for ${authData.client_id}. Please wait for active LCs to reach settlement.`,
+        subscription: authData.subscription_context,
+      });
+    }
+
+    // 8. Bind authoritative context to request object
     req.authContext = {
       clientId: authData.client_id,
       subscription: authData.subscription_context,
+      capacityStatus: authData.capacity_status,
       billingReceiptStatus: authData.billing_receipt_status,
+      acknowledgedReceiptId: authData.acknowledged_receipt_id,
       sessionMetadata: authData.session_metadata,
       orchestratorNodeId: NODE_ID,
     };
@@ -105,3 +126,4 @@ export const authenticateRequest = async (req, res, next) => {
     });
   }
 };
+

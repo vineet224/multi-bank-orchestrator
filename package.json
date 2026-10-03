@@ -12,6 +12,8 @@
     "dev:auth": "npm --workspace=auth-service run dev",
     "dev:orchestrator": "npm --workspace=orchestrator-service run dev",
     "start:auth": "npm --workspace=auth-service start",
-    "start:orchestrator": "npm --workspace=orchestrator-service start"
+    "start:orchestrator": "npm --workspace=orchestrator-service start",
+    "test": "node scripts/test-e2e.js"
   }
 }
+

@@ -49,11 +49,14 @@ const toIntrospectionResponseDTO = ({
   clientId = null,
   subscription = null,
   billingStatus = 'NOT_ATTACHED',
+  acknowledgedReceiptId = null,
+  capacityStatus = 'CAPACITY_OK',
   issuedAt = null,
   expiresInSeconds = 0,
 }) => ({
   token_status: status,
   client_id: clientId,
+  capacity_status: capacityStatus,
   ...(subscription && {
     subscription_context: {
       status: subscription.status,
@@ -63,6 +66,7 @@ const toIntrospectionResponseDTO = ({
     },
   }),
   billing_receipt_status: billingStatus,
+  acknowledged_receipt_id: acknowledgedReceiptId,
   ...(issuedAt && {
     session_metadata: {
       issued_at: issuedAt,
@@ -147,12 +151,15 @@ export const login = (req, res) => {
  * POST /api/v1/auth/validate-opaque-token
  * Authoritative inspection endpoint (OAuth2 RFC 7662 style)
  * Headers: Authorization: Bearer <token>, X-Orchestrator-Node-Id: <nodeId>
- * Body: Optional { piggybacked_billing_receipt?: BillingReceipt }
+ * Body: Optional { 
+ *   piggybacked_billing_receipt?: BillingReceipt,
+ *   workflow_action?: 'INITIATE_WORKFLOW' | 'TERMINATE_WORKFLOW' | 'INSPECT'
+ * }
  */
 export const validateOpaqueToken = (req, res) => {
   const authHeader = req.headers['authorization'] || '';
   const orchestratorNodeId = req.headers['x-orchestrator-node-id'] || 'unknown-node';
-  const { piggybacked_billing_receipt } = req.body || {};
+  const { piggybacked_billing_receipt, workflow_action = 'INSPECT' } = req.body || {};
 
   // 1. Extract Bearer token
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
@@ -192,15 +199,40 @@ export const validateOpaqueToken = (req, res) => {
 
   // 4. Atomically persist piggybacked billing receipt if attached
   let billingStatus = 'NOT_ATTACHED';
+  let acknowledgedReceiptId = null;
   if (piggybacked_billing_receipt && piggybacked_billing_receipt.workflow_id) {
-    authStore.recordBilling({
+    const recordResult = authStore.recordBilling({
       ...piggybacked_billing_receipt,
       orchestratorNodeId,
     });
-    billingStatus = 'ACKNOWLEDGED_AND_LEDGERED';
+    billingStatus = recordResult.already_recorded ? 'ALREADY_LEDGERED' : 'ACKNOWLEDGED_AND_LEDGERED';
+    acknowledgedReceiptId = recordResult.acknowledged_receipt_id;
   }
 
-  // 5. Calculate remaining TTL in seconds
+  // 5. Active Concurrent Capacity Licensing Check
+  let capacityStatus = 'CAPACITY_OK';
+  if (workflow_action === 'INITIATE_WORKFLOW') {
+    const capacityCheck = authStore.checkAndIncrementCapacity(client.clientId);
+    if (!capacityCheck.allowed) {
+      capacityStatus = 'CAPACITY_LIMIT_EXCEEDED';
+      return res.status(200).json(
+        toIntrospectionResponseDTO({
+          status: 'VALID',
+          clientId: client.clientId,
+          subscription: client.subscription,
+          capacityStatus,
+          billingStatus,
+          acknowledgedReceiptId,
+          issuedAt: tokenRecord.issuedAt,
+          expiresInSeconds: Math.round((tokenRecord.expiresAt - Date.now()) / 1000),
+        })
+      );
+    }
+  } else if (workflow_action === 'TERMINATE_WORKFLOW') {
+    authStore.decrementCapacity(client.clientId);
+  }
+
+  // 6. Calculate remaining TTL in seconds
   const remainingSeconds = Math.round((tokenRecord.expiresAt - Date.now()) / 1000);
 
   return res.status(200).json(
@@ -208,11 +240,49 @@ export const validateOpaqueToken = (req, res) => {
       status: 'VALID',
       clientId: client.clientId,
       subscription: client.subscription,
+      capacityStatus,
       billingStatus,
+      acknowledgedReceiptId,
       issuedAt: tokenRecord.issuedAt,
       expiresInSeconds: remainingSeconds,
     })
   );
+};
+
+/**
+ * POST /api/v1/auth/m2m-flush-receipts
+ * Dedicated machine-to-machine channel for background idle timer flushes
+ * Protected via node identity credentials (Problem B: Platform Channel Trust)
+ */
+export const m2mFlushReceipts = (req, res) => {
+  const nodeId = req.headers['x-platform-node-id'];
+  const platformSecret = req.headers['x-platform-secret'];
+  const { receipts = [] } = req.body || {};
+
+  if (!nodeId || !platformSecret || !authStore.verifyPlatformNode(nodeId, platformSecret)) {
+    return res.status(401).json({
+      error: 'unauthorized_platform_node',
+      message: 'Invalid platform M2M node credentials. Channel trust verification failed.',
+    });
+  }
+
+  const acknowledgedIds = [];
+  for (const receipt of receipts) {
+    if (receipt && receipt.workflow_id) {
+      const result = authStore.recordBilling({
+        ...receipt,
+        orchestratorNodeId: nodeId,
+      });
+      acknowledgedIds.push(result.acknowledged_receipt_id);
+    }
+  }
+
+  return res.status(200).json({
+    success: true,
+    flushed_count: acknowledgedIds.length,
+    acknowledged_receipt_ids: acknowledgedIds,
+    ledgered_at: new Date().toISOString(),
+  });
 };
 
 /**
@@ -232,3 +302,4 @@ export const revoke = (req, res) => {
   const revoked = authStore.revokeToken(token);
   return res.status(200).json({ revoked });
 };
+

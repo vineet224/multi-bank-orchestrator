@@ -148,24 +148,107 @@ export class InMemoryAuthStore {
   }
 
   /**
-   * Validates and atomically appends a piggybacked billing receipt to the ledger
+   * Atomically checks and increments active workflow capacity for a client
+   * @param {string} clientId
+   * @returns {{ allowed: boolean, currentActive: number, maxLimit: number, reason?: string }}
+   */
+  checkAndIncrementCapacity(clientId) {
+    const client = this.findClient(clientId);
+    if (!client) {
+      return { allowed: false, currentActive: 0, maxLimit: 0, reason: 'CLIENT_NOT_FOUND' };
+    }
+
+    if (client.subscription.status !== 'ACTIVE') {
+      return { allowed: false, currentActive: client.subscription.activeWorkflows, maxLimit: client.subscription.maxConcurrentWorkflows, reason: 'SUBSCRIPTION_INACTIVE' };
+    }
+
+    if (client.subscription.activeWorkflows >= client.subscription.maxConcurrentWorkflows) {
+      return {
+        allowed: false,
+        currentActive: client.subscription.activeWorkflows,
+        maxLimit: client.subscription.maxConcurrentWorkflows,
+        reason: 'CAPACITY_LIMIT_EXCEEDED',
+      };
+    }
+
+    client.subscription.activeWorkflows += 1;
+    this.saveClient(client);
+
+    return {
+      allowed: true,
+      currentActive: client.subscription.activeWorkflows,
+      maxLimit: client.subscription.maxConcurrentWorkflows,
+    };
+  }
+
+  /**
+   * Decrements active workflow capacity for a client upon terminal state
+   * @param {string} clientId
+   * @returns {{ currentActive: number, maxLimit: number }}
+   */
+  decrementCapacity(clientId) {
+    const client = this.findClient(clientId);
+    if (!client) return { currentActive: 0, maxLimit: 0 };
+
+    client.subscription.activeWorkflows = Math.max(0, client.subscription.activeWorkflows - 1);
+    this.saveClient(client);
+
+    return {
+      currentActive: client.subscription.activeWorkflows,
+      maxLimit: client.subscription.maxConcurrentWorkflows,
+    };
+  }
+
+  /**
+   * Validates and atomically appends a piggybacked billing receipt to the ledger with deduplication
    * @param {BillingReceipt} receipt
-   * @returns {BillingReceipt}
+   * @returns {{ acknowledged_receipt_id: string, already_recorded: boolean, ledgeredAt: string }}
    */
   recordBilling(receipt) {
     if (!receipt || !receipt.workflow_id) {
       throw new Error('Invalid billing receipt: workflow_id is required');
     }
 
+    const dedupeKey = `${receipt.workflow_id}_${receipt.terminal_state_achieved || 'COMPLETED'}`;
+    const existing = this.billingLedger.get(dedupeKey);
+    if (existing) {
+      return {
+        acknowledged_receipt_id: receipt.workflow_id,
+        already_recorded: true,
+        ledgeredAt: existing.ledgeredAt,
+      };
+    }
+
     const ledgeredReceipt = {
       ...receipt,
+      dedupeKey,
       ledgeredAt: new Date().toISOString(),
     };
 
-    this.billingLedger.set(receipt.workflow_id, ledgeredReceipt);
-    return ledgeredReceipt;
+    this.billingLedger.set(dedupeKey, ledgeredReceipt);
+    return {
+      acknowledged_receipt_id: receipt.workflow_id,
+      already_recorded: false,
+      ledgeredAt: ledgeredReceipt.ledgeredAt,
+    };
+  }
+
+  /**
+   * Verifies machine-to-machine platform node credentials for background worker flushes
+   * @param {string} nodeId
+   * @param {string} platformSecret
+   * @returns {boolean}
+   */
+  verifyPlatformNode(nodeId, platformSecret) {
+    // In production: checked against mTLS client cert or pre-shared secure key store
+    const KNOWN_NODES = {
+      'node-orchestrator-01': 'xalts_platform_secret_m2m_node_01',
+      'tata-onprem-node-01': 'xalts_platform_secret_tata_node_01',
+    };
+    return KNOWN_NODES[nodeId] === platformSecret;
   }
 }
 
 // Singleton storage export for interview reference
 export const authStore = new InMemoryAuthStore();
+

@@ -1,19 +1,22 @@
 import crypto from 'crypto';
 import { orchestratorStore } from '../storage/inMemoryOrchestratorStore.js';
+import { CryptoProviderFactory } from '../crypto/cryptoProviderFactory.js';
+import { bankConnectorService } from '../services/bankConnector.service.js';
 
 /**
  * ============================================================================
  * INTERVIEW RECALL: Orchestrator Controller (orchestratorController.js)
  * ============================================================================
  * 
- * ITERATION 1: Baseline Prototype
+ * ITERATION 2: Non-Custodial Multi-Bank Enterprise Gateway
  * 
  * Architectural Purpose:
- * - Serves as the multi-bank gateway for Trade Finance / Letter of Credit (LC).
- * - Enforces supported bank integrations strictly: ['HSBC', 'SBI'].
- * - Receives canonical client requests, initializes multi-stage LC state machines,
- *   and prepares execution context for bank-specific DAG adapters (Iteration 2).
- * - Non-custodial security: Rejects any attempt to upload corporate private keys.
+ * - Multi-bank gateway for Trade Finance (Letters of Credit).
+ * - Enforces supported banks: ['HSBC', 'SBI'].
+ * - Non-custodial security boundary: Rejects any attempt to upload corporate private keys.
+ * - Coordinates Pluggable Crypto Providers (AWS KMS, Azure Key Vault, Remote Webhook, Local Mock).
+ * - Implements 2-step financial state transitions (INITIATED -> DISPATCHED_PENDING_ACK -> CONFIRMED).
+ * - Enqueues terminal billing receipts to be piggybacked on outbound Auth Service hops.
  */
 
 const SUPPORTED_BANKS = ['HSBC', 'SBI'];
@@ -34,6 +37,28 @@ export const validateBankId = (req, res, next) => {
 };
 
 /**
+ * GET /api/v1/bank-integration/credentials/:bankId
+ * Returns the onboarded cryptographic credentials and provider configuration for the client
+ */
+export const getBankCredentials = (req, res) => {
+  const { bankId } = req.params;
+  const { clientId } = req.authContext;
+
+  const credentials = orchestratorStore.getBankCredentials(clientId, bankId);
+  if (!credentials) {
+    return res.status(404).json({
+      error: 'credentials_not_found',
+      message: `No credentials mapped for client '${clientId}' with bank '${bankId}'`,
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: credentials,
+  });
+};
+
+/**
  * POST /api/v1/upload/bank-integration/credentials/:bankId
  * Binds corporate client public key & bank public key for asymmetric exchange.
  * Security Guard: Rejects any request containing private key attributes.
@@ -41,7 +66,7 @@ export const validateBankId = (req, res, next) => {
 export const uploadBankCredentials = (req, res) => {
   const { bankId } = req.params;
   const { clientId } = req.authContext;
-  const { clientPublicKey, bankPublicKey, cryptoMode = 'AWS_KMS' } = req.body;
+  let { clientPublicKey, bankPublicKey, cryptoMode = 'LOCAL_MOCK', cryptoConfig = {} } = req.body;
 
   // 1. Non-custodial security check: Forbid corporate private keys
   if (req.body.privateKey || req.body.secretKey || req.body.clientPrivateKey) {
@@ -51,15 +76,8 @@ export const uploadBankCredentials = (req, res) => {
     });
   }
 
-  if (!clientPublicKey || !bankPublicKey) {
-    return res.status(400).json({
-      error: 'bad_request',
-      message: 'Both clientPublicKey and bankPublicKey (in PEM format) are required',
-    });
-  }
-
   // 2. Validate crypto execution mode
-  const validCryptoModes = ['AWS_KMS', 'AZURE_VAULT', 'REMOTE_API'];
+  const validCryptoModes = ['LOCAL_MOCK', 'AWS_KMS', 'AZURE_VAULT', 'REMOTE_API'];
   if (!validCryptoModes.includes(cryptoMode)) {
     return res.status(400).json({
       error: 'bad_request',
@@ -67,13 +85,30 @@ export const uploadBankCredentials = (req, res) => {
     });
   }
 
-  // 3. Persist to in-memory store
+  // 3. Fallback public key resolution if not explicitly passed
+  if (!clientPublicKey || !bankPublicKey) {
+    const provider = CryptoProviderFactory.create({ cryptoMode, cryptoConfig });
+    clientPublicKey = clientPublicKey || provider.getPublicKeyPem();
+    const adapter = bankConnectorService.getAdapter(bankId);
+    bankPublicKey = bankPublicKey || adapter.getBankPublicKeyPem();
+  }
+
+  if (!clientPublicKey || !bankPublicKey) {
+    return res.status(400).json({
+      error: 'bad_request',
+      message: 'Both clientPublicKey and bankPublicKey (in PEM format) are required',
+    });
+  }
+
+
+  // 4. Persist to in-memory store
   const credentialRecord = orchestratorStore.saveBankCredentials({
     clientId,
     bankId,
     clientPublicKey,
     bankPublicKey,
     cryptoMode,
+    cryptoConfig,
   });
 
   return res.status(201).json({
@@ -130,10 +165,14 @@ export const getLetterOfCredit = (req, res) => {
 
 /**
  * POST /api/v1/letter_of_credit/issuance/:bankId
- * Generates workflowId, initializes canonical LC state (LC_INITIATED),
- * and prepares context for Iteration 2 bank DAG routing.
+ * 1. Checks active concurrent capacity licensing.
+ * 2. Instantiates non-custodial crypto provider.
+ * 3. Sets state: LC_INITIATED -> DISPATCHED_PENDING_ACK.
+ * 4. Dispatches signed (Client Private Key) & encrypted (Bank Public Key) payload to bank.
+ * 5. Verifies Bank signature & decrypts bank confirmation.
+ * 6. Transitions to ISSUANCE_CONFIRMED.
  */
-export const initiateIssuance = (req, res) => {
+export const initiateIssuance = async (req, res) => {
   const { bankId } = req.params;
   const { clientId } = req.authContext;
   const genericContract = req.body;
@@ -147,20 +186,27 @@ export const initiateIssuance = (req, res) => {
     });
   }
 
-  // 2. Generate unique workflow ID
+  // 2. Generate unique workflow ID & canonical LC Number
   const workflowId = `LC-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const canonicalContract = {
+    ...genericContract,
+    lcNumber: genericContract.lcNumber || `LC/${bankId}/${new Date().getFullYear()}/${Date.now().toString().slice(-4)}`,
+    amount: genericContract.amount || 1000000,
+    currency: genericContract.currency || (bankId === 'SBI' ? 'INR' : 'USD'),
+    applicant: genericContract.applicant || clientId,
+    beneficiary: genericContract.beneficiary || 'Global Trade Partner Inc',
+    expiryDate: genericContract.expiryDate || '2026-12-31',
+    version: 1,
+  };
 
-  // 3. Initialize workflow instance
+  // 3. Initialize workflow instance with 2-step financial transition
   const workflow = {
     workflowId,
     clientId,
     bankId,
     type: 'ISSUANCE',
     currentStage: 'LC_INITIATED',
-    genericContract: {
-      ...genericContract,
-      lcNumber: genericContract.lcNumber || `LC/${bankId}/${new Date().getFullYear()}/${Date.now().toString().slice(-4)}`,
-    },
+    genericContract: canonicalContract,
     history: [
       {
         stage: 'LC_INITIATED',
@@ -176,29 +222,90 @@ export const initiateIssuance = (req, res) => {
 
   orchestratorStore.saveWorkflow(workflow);
 
-  // 4. Return 202 Accepted (asynchronous workflow pattern)
-  return res.status(202).json({
-    status: 'ACCEPTED',
-    workflow_id: workflowId,
-    bank_id: bankId,
-    current_stage: 'LC_INITIATED',
-    execution_context: {
-      crypto_mode: credentials.cryptoMode,
-      target_bank_adapter: `${bankId}_LC_DAG_ADAPTER_v1`,
-      next_stage: 'PREPARE_BANK_TRANSLATION',
-      iteration_note: 'Iteration 1 baseline: Workflow initialized. Bank-specific DAG execution queued for Iteration 2.',
-    },
+  // 4. Transition to DISPATCHED_PENDING_ACK (protects against duplicate financial issuance)
+  workflow.currentStage = 'DISPATCHED_PENDING_ACK';
+  workflow.history.push({
+    stage: 'DISPATCHED_PENDING_ACK',
+    timestamp: new Date().toISOString(),
+    trigger: 'DISPATCH_COMMENCED',
+    metadata: { targetBank: bankId },
   });
+  orchestratorStore.saveWorkflow(workflow);
+
+  try {
+    // 5. Instantiate non-custodial crypto provider on demand
+    const cryptoProvider = CryptoProviderFactory.create(credentials);
+
+    // 6. Execute cryptographic dispatch pipeline:
+    //    - Deterministic Idempotency Key
+    //    - Sign 32-byte digest via client KMS/HSM
+    //    - Encrypt payload via Bank Public Key (AES-GCM envelope)
+    //    - Verify Bank signature & decrypt response
+    const bankResult = await bankConnectorService.dispatchToBank({
+      bankId,
+      clientId,
+      genericContract: canonicalContract,
+      cryptoProvider,
+    });
+
+    // 7. Transition to ISSUANCE_CONFIRMED
+    workflow.currentStage = 'ISSUANCE_CONFIRMED';
+    workflow.history.push({
+      stage: 'ISSUANCE_CONFIRMED',
+      timestamp: new Date().toISOString(),
+      trigger: 'BANK_DISPATCH_SUCCESS',
+      metadata: {
+        bankReference: bankResult.bankReference,
+        idempotencyKey: bankResult.idempotencyKey,
+        clientSignature: bankResult.clientSignature.slice(0, 32) + '...',
+        bankSignature: bankResult.bankSignature.slice(0, 32) + '...',
+      },
+    });
+
+    orchestratorStore.saveWorkflow(workflow);
+
+    return res.status(201).json({
+      status: 'CONFIRMED',
+      workflow_id: workflowId,
+      bank_id: bankId,
+      current_stage: workflow.currentStage,
+      bank_reference: bankResult.bankReference,
+      idempotency_key: bankResult.idempotencyKey,
+      crypto_execution: {
+        provider_mode: credentials.cryptoMode,
+        client_digest_signed: true,
+        bank_envelope_encrypted: true,
+        bank_signature_verified: true,
+      },
+      bank_response: bankResult.bankResponse,
+      subscription_status: req.authContext.subscription,
+    });
+  } catch (err) {
+    workflow.currentStage = 'DISPATCH_FAILED';
+    workflow.history.push({
+      stage: 'DISPATCH_FAILED',
+      timestamp: new Date().toISOString(),
+      trigger: 'BANK_DISPATCH_ERROR',
+      metadata: { error: err.message },
+    });
+    orchestratorStore.saveWorkflow(workflow);
+
+    return res.status(502).json({
+      error: 'bank_dispatch_failed',
+      message: err.message,
+      workflow_id: workflowId,
+    });
+  }
 };
 
 /**
  * POST /api/v1/letter_of_credit/amendment/:bankId
- * Validates active LC existence and transitions to AMENDMENT_REQUESTED.
+ * Validates active LC existence and transitions to AMENDMENT_CONFIRMED via Bank Connector.
  */
-export const requestAmendment = (req, res) => {
+export const requestAmendment = async (req, res) => {
   const { bankId } = req.params;
   const { clientId } = req.authContext;
-  const { workflowId, amendmentDetails } = req.body;
+  const { workflowId, amendmentDetails = {} } = req.body;
 
   if (!workflowId) {
     return res.status(400).json({
@@ -222,33 +329,70 @@ export const requestAmendment = (req, res) => {
     });
   }
 
-  // Transition workflow state
-  workflow.currentStage = 'AMENDMENT_REQUESTED';
-  workflow.history.push({
-    stage: 'AMENDMENT_REQUESTED',
-    timestamp: new Date().toISOString(),
-    trigger: 'CLIENT_AMENDMENT_REQUEST',
-    metadata: { amendmentDetails },
-  });
+  const credentials = orchestratorStore.getBankCredentials(clientId, bankId);
+  if (!credentials) {
+    return res.status(412).json({
+      error: 'precondition_failed',
+      message: `No credentials mapped for ${clientId} with ${bankId}`,
+    });
+  }
 
-  orchestratorStore.saveWorkflow(workflow);
+  // Update contract version
+  const newVersion = (workflow.genericContract.version || 1) + 1;
+  const updatedContract = {
+    ...workflow.genericContract,
+    ...amendmentDetails,
+    version: newVersion,
+  };
 
-  return res.status(202).json({
-    status: 'ACCEPTED',
-    workflow_id: workflow.workflowId,
-    current_stage: workflow.currentStage,
-    message: 'Letter of credit amendment request recorded and queued for bank dispatch',
-  });
+  try {
+    const cryptoProvider = CryptoProviderFactory.create(credentials);
+    const bankResult = await bankConnectorService.dispatchToBank({
+      bankId,
+      clientId,
+      genericContract: updatedContract,
+      cryptoProvider,
+    });
+
+    workflow.genericContract = updatedContract;
+    workflow.currentStage = 'AMENDMENT_CONFIRMED';
+    workflow.history.push({
+      stage: 'AMENDMENT_CONFIRMED',
+      timestamp: new Date().toISOString(),
+      trigger: 'CLIENT_AMENDMENT_REQUEST',
+      metadata: {
+        amendmentDetails,
+        bankReference: bankResult.bankReference,
+        idempotencyKey: bankResult.idempotencyKey,
+      },
+    });
+
+    orchestratorStore.saveWorkflow(workflow);
+
+    return res.status(200).json({
+      status: 'CONFIRMED',
+      workflow_id: workflow.workflowId,
+      current_stage: workflow.currentStage,
+      bank_reference: bankResult.bankReference,
+      message: 'Letter of credit amendment successfully signed, encrypted, and confirmed by bank',
+    });
+  } catch (err) {
+    return res.status(502).json({
+      error: 'amendment_dispatch_failed',
+      message: err.message,
+    });
+  }
 };
 
 /**
  * POST /api/v1/letter_of_credit/presentation/:bankId
  * Transitions workflow to DOCUMENTS_PRESENTED and enqueues completed billing receipt.
+ * The receipt will be piggybacked on the next outbound Auth Service hop or drained by the idle flusher.
  */
-export const presentDocuments = (req, res) => {
+export const presentDocuments = async (req, res) => {
   const { bankId } = req.params;
   const { clientId } = req.authContext;
-  const { workflowId, documentManifest } = req.body;
+  const { workflowId, documentManifest = {} } = req.body;
 
   if (!workflowId) {
     return res.status(400).json({
@@ -283,19 +427,22 @@ export const presentDocuments = (req, res) => {
 
   orchestratorStore.saveWorkflow(workflow);
 
-  // Enqueue a completed billing receipt to demonstrate piggybacked billing on next auth call
-  orchestratorStore.enqueueBillingReceipt({
+  // Enqueue a completed billing receipt to be piggybacked on next Auth Service network hop
+  const receipt = {
     workflow_id: workflow.workflowId,
     terminal_state_achieved: 'DOCUMENTS_PRESENTED',
-    cryptographic_signature: `sig_rsa_${crypto.randomBytes(8).toString('hex')}`,
+    cryptographic_signature: `sig_rsa_pss_${crypto.randomBytes(12).toString('hex')}`,
     timestamp: new Date().toISOString(),
-  });
+  };
 
-  return res.status(202).json({
+  orchestratorStore.enqueueBillingReceipt(receipt);
+
+  return res.status(200).json({
     status: 'ACCEPTED',
     workflow_id: workflow.workflowId,
     current_stage: workflow.currentStage,
-    billing_notice: 'Receipt enqueued to be piggybacked on next Auth Service network hop',
+    billing_notice: 'Receipt enqueued: Will be piggybacked on next Auth hop or flushed by idle worker',
+    pending_receipts_in_queue: orchestratorStore.getPendingReceiptsCount(),
     message: 'Documents presented successfully',
   });
 };

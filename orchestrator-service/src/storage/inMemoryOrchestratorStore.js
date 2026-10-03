@@ -215,6 +215,35 @@ export class InMemoryOrchestratorStore {
   peekNextBillingReceipt() {
     return this.pendingReceiptsQueue[0] || null;
   }
+
+  /**
+   * Removes an acknowledged receipt from the pending queue
+   * @param {string} workflowId
+   */
+  acknowledgeReceipt(workflowId) {
+    this.pendingReceiptsQueue = this.pendingReceiptsQueue.filter(
+      (r) => r.workflow_id !== workflowId
+    );
+  }
+
+  /**
+   * Drains all pending receipts from the queue (used by background idle flusher)
+   * @returns {Array<BillingReceipt>}
+   */
+  drainPendingReceipts() {
+    const receipts = [...this.pendingReceiptsQueue];
+    this.pendingReceiptsQueue = [];
+    return receipts;
+  }
+
+  /**
+   * Get queue length
+   * @returns {number}
+   */
+  getPendingReceiptsCount() {
+    return this.pendingReceiptsQueue.length;
+  }
 }
 
 export const orchestratorStore = new InMemoryOrchestratorStore();
+

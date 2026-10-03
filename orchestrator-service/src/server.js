@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import orchestratorRoutes from './routes/orchestrator.routes.js';
+import { idleReceiptFlusher } from './workers/idleReceiptFlusher.js';
 
 dotenv.config();
 
@@ -17,8 +18,9 @@ app.get('/health', (req, res) => {
     service: 'orchestrator-service',
     status: 'UP',
     port: PORT,
-    iteration: 'Iteration 1 (Baseline Gateway)',
+    iteration: 'Iteration 2 (Non-Custodial Multi-Bank Gateway)',
     supportedBanks: ['HSBC', 'SBI'],
+    cryptoModes: ['LOCAL_MOCK', 'AWS_KMS', 'AZURE_VAULT', 'REMOTE_API'],
   });
 });
 
@@ -28,6 +30,9 @@ app.use('/', orchestratorRoutes);
 
 app.listen(PORT, () => {
   console.log(`🏦 [Orchestrator Service] running on http://localhost:${PORT}`);
+  // Start background flusher (runs every 30 seconds to drain lingering receipts)
+  idleReceiptFlusher.start(30000);
 });
 
 export default app;
+

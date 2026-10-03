@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   validateBankId,
   uploadBankCredentials,
+  getBankCredentials,
   getLetterOfCredit,
   initiateIssuance,
   requestAmendment,
@@ -20,6 +21,13 @@ router.post(
   validateBankId,
   uploadBankCredentials
 );
+
+router.get(
+  '/bank-integration/credentials/:bankId',
+  validateBankId,
+  getBankCredentials
+);
+
 
 // Letter of Credit Lifecycle Endpoints
 router.get(
