@@ -256,7 +256,7 @@ export const validateOpaqueToken = (req, res) => {
  */
 export const m2mFlushReceipts = (req, res) => {
   const nodeId = req.headers['x-platform-node-id'];
-  const platformSecret = req.headers['x-platform-secret'];
+  const platformSecret = req.headers['x-platform-secret']; // Important : does the client side bad party if got these secrets they can use these to call the xalts server with fake data
   const { receipts = [] } = req.body || {};
 
   if (!nodeId || !platformSecret || !authStore.verifyPlatformNode(nodeId, platformSecret)) {
