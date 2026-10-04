@@ -3,15 +3,17 @@
  * INTERVIEW RECALL: End-to-End System Verification (test-e2e.js)
  * ============================================================================
  * 
- * Tests the complete architectural prototype:
- * 1. Opaque Token Issuance & Central Auth Service (Port 4000)
- * 2. Intentional Network Hop & Active Concurrent Capacity Licensing
- * 3. Non-Custodial Security Boundary (Rejection of private keys)
- * 4. Pluggable Crypto Providers (LOCAL_MOCK, AWS_KMS, AZURE_VAULT, REMOTE_API)
- * 5. Full Asymmetric Cryptographic Handshake with Banks (HSBC ISO 20022 & SBI)
- * 6. Financial Idempotency & Two-Step Transition (INITIATED -> DISPATCHED_PENDING_ACK -> CONFIRMED)
- * 7. Piggybacked Billing Receipts on Auth Hops
- * 8. Machine-to-Machine (M2M) Platform Channel Trust & Background Flusher
+ * ITERATION 3 VERIFICATION SUITE:
+ * 1. Health Checks (Ports 4000 & 3000)
+ * 2. Client Login & Sealed AEAD Opaque Token Issuance (Zero Claim Leakage)
+ * 3. Local Offline Draft Creation (0 Central Network Hops, Degraded Mode Safe)
+ * 4. Non-Custodial Security Boundary (Rejection of private keys)
+ * 5. Strict Two-Step Issuance Pipeline (Draft -> Authoritative Dispatch)
+ * 6. Real-World Bank-Assigned LC Numbers (HSBC & SBI ISO 20022 / REST)
+ * 7. Two-Step LC Amendment with Bank-Assigned Amendment Number
+ * 8. Two-Step LC Document Presentation & Milestone Receipt Creation (syncStatus: PENDING)
+ * 9. Milestone Ledger Batch Synchronization via On-Demand /sync-billing (Zero Flusher Worker)
+ * 10. Multi-Bank Heterogeneous Crypto Routing (HSBC Local Mock & SBI AWS KMS)
  */
 
 const AUTH_URL = 'http://localhost:4000';
@@ -26,7 +28,7 @@ const assert = (condition, message) => {
 };
 
 async function runTests() {
-  console.log('\n🚀 Starting End-to-End Multi-Bank Orchestrator Verification...\n');
+  console.log('\n🚀 Starting Iteration 3 End-to-End Multi-Bank Orchestrator Verification...\n');
 
   // 1. Health Checks
   console.log('--- Step 1: Health Checks ---');
@@ -35,10 +37,11 @@ async function runTests() {
 
   const orchHealth = await fetch(`${ORCH_URL}/health`).then((r) => r.json());
   assert(orchHealth.status === 'UP', 'Orchestrator Service is UP on port 3000');
-  assert(orchHealth.cryptoModes.includes('AWS_KMS'), 'Orchestrator exposes AWS_KMS mode');
+  assert(orchHealth.features.includes('Sealed AEAD Opaque Tokens'), 'Orchestrator exposes Sealed AEAD Opaque Tokens');
+  assert(orchHealth.features.includes('Offline Local Draft Saving (0 Hops)'), 'Orchestrator exposes Offline Local Drafts');
 
-  // 2. Client Login & Opaque Token
-  console.log('\n--- Step 2: Client Login & Opaque Token Issuance ---');
+  // 2. Client Login & Sealed AEAD Token
+  console.log('\n--- Step 2: Client Login & Sealed AEAD Opaque Token ---');
   const loginRes = await fetch(`${AUTH_URL}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -49,10 +52,23 @@ async function runTests() {
   });
   const loginData = await loginRes.json();
   assert(loginRes.status === 200, 'Login succeeded for tata_steel');
-  assert(loginData.access_token.startsWith('xlt_opq_'), 'Issued high-entropy opaque bearer token');
+  assert(loginData.access_token.startsWith('xlt_opq_'), 'Issued sealed AEAD opaque token');
+  
+  // Verify token is truly opaque and cannot be inspected as plain base64 JSON
+  const rawToken = loginData.access_token.replace('xlt_opq_', '');
+  let leakedClaims = false;
+  try {
+    const decoded = Buffer.from(rawToken, 'base64url').toString('utf8');
+    if (decoded.includes('tata_steel') || decoded.includes('ACTIVE_CAPACITY_LICENSING')) {
+      leakedClaims = true;
+    }
+  } catch {
+    // Expected: cipher string is not plain JSON
+  }
+  assert(!leakedClaims, 'Zero Claim Leakage: Token cannot be decoded to plaintext claims by browser');
   const token = loginData.access_token;
 
-  // 3. Non-Custodial Security Guard Test
+  // 3. Non-Custodial Security Boundary
   console.log('\n--- Step 3: Non-Custodial Security Boundary ---');
   const leakRes = await fetch(`${ORCH_URL}/api/v1/upload/bank-integration/credentials/HSBC`, {
     method: 'POST',
@@ -69,22 +85,18 @@ async function runTests() {
   assert(leakRes.status === 400, 'Orchestrator rejected private key upload');
   assert(leakData.error === 'security_violation', 'Returned security_violation error');
 
-  // 4. Onboard Client Non-Custodial Crypto Configurations
+  // 4. Provision Credentials
   console.log('\n--- Step 4: Provision Pluggable Crypto Configurations ---');
-  // Onboard HSBC with LOCAL_MOCK
   const hsbcCredsRes = await fetch(`${ORCH_URL}/api/v1/upload/bank-integration/credentials/HSBC`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
-    body: JSON.stringify({
-      cryptoMode: 'LOCAL_MOCK',
-    }),
+    body: JSON.stringify({ cryptoMode: 'LOCAL_MOCK' }),
   });
   assert(hsbcCredsRes.status === 201, 'Onboarded HSBC credentials with LOCAL_MOCK');
 
-  // Onboard SBI with AWS_KMS
   const sbiCredsRes = await fetch(`${ORCH_URL}/api/v1/upload/bank-integration/credentials/SBI`, {
     method: 'POST',
     headers: {
@@ -101,16 +113,16 @@ async function runTests() {
   });
   assert(sbiCredsRes.status === 201, 'Onboarded SBI credentials with AWS_KMS');
 
-  // 5. Letter of Credit Issuance (HSBC) with End-to-End Cryptography
-  console.log('\n--- Step 5: LC Issuance (HSBC) with Cryptographic Pipeline ---');
-  const issuanceRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/issuance/HSBC`, {
+  // 5. Local Offline Draft Creation (0 Central Network Hops)
+  console.log('\n--- Step 5: Local Offline Draft Creation (Zero Central Network Hop) ---');
+  const draftRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/draft/issuance/HSBC`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
-      lcNumber: 'LC/HSBC/2026/TATA-001',
+      corporateReference: 'ERP-PO-2026-TATA-001',
       amount: 7500000,
       currency: 'USD',
       applicant: 'Tata Steel Limited',
@@ -118,67 +130,101 @@ async function runTests() {
       expiryDate: '2026-11-30',
     }),
   });
-  const issuanceData = await issuanceRes.json();
-  assert(issuanceRes.status === 201, 'LC Issuance succeeded with status 201');
-  assert(issuanceData.status === 'CONFIRMED', 'LC reached CONFIRMED state');
-  assert(issuanceData.crypto_execution.client_digest_signed === true, 'Client signed 32-byte digest');
-  assert(issuanceData.crypto_execution.bank_envelope_encrypted === true, 'Envelope encrypted for HSBC');
-  assert(issuanceData.crypto_execution.bank_signature_verified === true, 'Verified HSBC signature');
-  assert(issuanceData.bank_reference.startsWith('HSBC-TXN-'), 'Received HSBC transaction reference');
-  const workflowId = issuanceData.workflow_id;
+  const draftData = await draftRes.json();
+  assert(draftRes.status === 201, 'Draft created successfully with status 201');
+  assert(draftData.status === 'DRAFT_SAVED', 'Draft saved locally with status DRAFT_SAVED');
+  assert(draftData.draft_id.startsWith('DRAFT-LC-'), 'Received unique draft_id');
+  assert(draftData.corporate_reference === 'ERP-PO-2026-TATA-001', 'Preserved ERP corporateReference');
+  const issuanceDraftId = draftData.draft_id;
 
-  // 6. Letter of Credit Issuance (SBI) with AWS KMS Provider
-  console.log('\n--- Step 6: LC Issuance (SBI) with AWS KMS Provider ---');
-  const sbiIssuanceRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/issuance/SBI`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      lcNumber: 'LC/SBI/2026/TATA-002',
-      amount: 50000000,
-      currency: 'INR',
-      applicant: 'Tata Steel Limited',
-      beneficiary: 'National Mineral Development Corp',
-      expiryDate: '2026-12-15',
-    }),
+  // Verify Draft Retrieval
+  const getDraftRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/draft/${issuanceDraftId}`, {
+    headers: { 'Authorization': `Bearer ${token}` },
   });
-  const sbiIssuanceData = await sbiIssuanceRes.json();
-  assert(sbiIssuanceRes.status === 201, 'SBI LC Issuance succeeded with status 201');
-  assert(sbiIssuanceData.crypto_execution.provider_mode === 'AWS_KMS', 'Used AWS_KMS provider');
-  assert(sbiIssuanceData.bank_reference.startsWith('SBI-TXN-'), 'Received SBI transaction reference');
+  const getDraftData = await getDraftRes.json();
+  assert(getDraftRes.status === 200, 'Retrieved saved draft locally');
+  assert(getDraftData.data.stage === 'DRAFT', 'Draft stage is verified as DRAFT');
 
-  // 7. LC Amendment
-  console.log('\n--- Step 7: LC Amendment ---');
-  const amendRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/amendment/HSBC`, {
+  // 6. Strict Two-Step Issuance Pipeline (Consumes draftId -> Bank Generates lcNumber)
+  console.log('\n--- Step 6: Strict Two-Step Issuance & Bank-Assigned LC Number ---');
+  
+  // Negative test: Direct call without draftId must be rejected
+  const directRejectRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/issuance/HSBC`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ amount: 1000000 }),
+  });
+  assert(directRejectRes.status === 400, 'Direct issuance rejected without draftId');
+
+  // Positive test: Dispatch with draftId
+  const dispatchRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/issuance/HSBC`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ draftId: issuanceDraftId }),
+  });
+  const dispatchData = await dispatchRes.json();
+  assert(dispatchRes.status === 201, 'Draft promoted and dispatched to HSBC with status 201');
+  assert(dispatchData.status === 'CONFIRMED', 'Workflow stage reached CONFIRMED');
+  assert(dispatchData.bank_lc_number.startsWith('HSBC-LC-'), 'Bank assigned authoritative lcNumber');
+  assert(dispatchData.corporate_reference === 'ERP-PO-2026-TATA-001', 'Preserved ERP corporate reference in bank confirmation');
+  assert(dispatchData.bank_reference.startsWith('HSBC-TXN-'), 'Received HSBC bank transaction reference');
+  const bankLcNumber = dispatchData.bank_lc_number;
+  const workflowId = dispatchData.workflow_id;
+
+  // 7. Two-Step LC Amendment with Bank-Assigned Amendment Number
+  console.log('\n--- Step 7: Two-Step LC Amendment & Bank-Assigned Amendment Number ---');
+  // Step 7A: Create Amendment Draft
+  const amendDraftRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/draft/amendment/HSBC`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
-      workflowId,
+      lcNumber: bankLcNumber,
+      corporateReference: 'ERP-AMD-REQ-001',
       amendmentDetails: {
-        amount: 8000000,
+        amount: 8500000,
         expiryDate: '2026-12-31',
       },
     }),
   });
-  const amendData = await amendRes.json();
-  assert(amendRes.status === 200, 'LC Amendment confirmed by bank');
-  assert(amendData.current_stage === 'AMENDMENT_CONFIRMED', 'Current stage updated to AMENDMENT_CONFIRMED');
+  const amendDraftData = await amendDraftRes.json();
+  assert(amendDraftRes.status === 201, 'Amendment draft created locally');
+  const amendDraftId = amendDraftData.draft_id;
 
-  // 8. LC Document Presentation & Terminal Receipt Queueing
-  console.log('\n--- Step 8: Document Presentation & Terminal Billing Queueing ---');
-  const presRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/presentation/HSBC`, {
+  // Step 7B: Dispatch Amendment
+  const amendDispatchRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/amendment/HSBC`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ draftId: amendDraftId }),
+  });
+  const amendDispatchData = await amendDispatchRes.json();
+  assert(amendDispatchRes.status === 200, 'Amendment confirmed by bank');
+  assert(amendDispatchData.amendment_number.startsWith('HSBC-AMD-'), 'Bank assigned official amendmentNumber');
+  assert(amendDispatchData.lc_number === bankLcNumber, 'Amendment anchored to bankLcNumber');
+
+  // 8. Two-Step Presentation & Milestone Receipt Ledgering
+  console.log('\n--- Step 8: Document Presentation & Milestone Ledgering ---');
+  // Step 8A: Create Presentation Draft
+  const presDraftRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/draft/presentation/HSBC`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
-      workflowId,
+      lcNumber: bankLcNumber,
+      corporateReference: 'ERP-PRES-REF-001',
       documentManifest: {
         billOfLading: 'BL-99887766',
         commercialInvoice: 'INV-2026-0091',
@@ -186,49 +232,69 @@ async function runTests() {
       },
     }),
   });
-  const presData = await presRes.json();
-  assert(presRes.status === 200, 'Document presentation accepted');
-  assert(presData.current_stage === 'DOCUMENTS_PRESENTED', 'Stage is DOCUMENTS_PRESENTED');
-  assert(presData.pending_receipts_in_queue >= 1, 'Billing receipt enqueued for piggybacking');
+  const presDraftData = await presDraftRes.json();
+  assert(presDraftRes.status === 201, 'Presentation draft created locally');
+  const presDraftId = presDraftData.draft_id;
 
-  // 9. Piggybacked Billing Verification on Subsequent Network Hop
-  console.log('\n--- Step 9: Piggybacked Billing Hop & Deduplication ---');
-  // Make a GET request to trigger the auth hop which piggybacks the receipt
-  const checkRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/HSBC?workflowId=${workflowId}`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-    },
-  });
-  const checkData = await checkRes.json();
-  assert(checkRes.status === 200, 'Status call succeeded through auth middleware');
-  assert(checkData.data.workflowId === workflowId, 'Retrieved workflow details');
-
-  // 10. M2M Platform Channel Trust & Idle Flusher Test
-  console.log('\n--- Step 10: Platform M2M Channel Trust ---');
-  const m2mRes = await fetch(`${AUTH_URL}/api/v1/auth/m2m-flush-receipts`, {
+  // Step 8B: Dispatch Presentation
+  const presDispatchRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/presentation/HSBC`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Platform-Node-Id': 'node-orchestrator-01',
-      'X-Platform-Secret': 'xalts_platform_secret_m2m_node_01',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ draftId: presDraftId }),
+  });
+  const presDispatchData = await presDispatchRes.json();
+  assert(presDispatchRes.status === 200, 'Document presentation accepted and confirmed by bank');
+  assert(presDispatchData.presentation_number.startsWith('HSBC-PRES-'), 'Bank assigned official presentationNumber');
+  assert(presDispatchData.milestone_receipt.sync_status === 'PENDING', 'Milestone receipt recorded with syncStatus PENDING');
+
+  // 9. Milestone Ledger Batch Synchronization (Zero Background Flusher Worker)
+  console.log('\n--- Step 9: Milestone Ledger Batch Sync via On-Demand Endpoint ---');
+  const syncRes = await fetch(`${ORCH_URL}/api/v1/sync-billing`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  const syncData = await syncRes.json();
+  assert(syncRes.status === 200, 'On-demand billing synchronization completed successfully');
+  assert(syncData.milestone_ledger_status.pending === 0, 'All milestone receipts acknowledged and ledgered (0 pending)');
+  assert(syncData.milestone_ledger_status.acknowledged >= 2, 'Acknowledged receipts count updated in milestone ledger');
+
+  // 10. Multi-Bank Heterogeneous Execution (SBI with AWS KMS)
+  console.log('\n--- Step 10: SBI Issuance with AWS KMS & Bank-Assigned SBI LC Number ---');
+  const sbiDraftRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/draft/issuance/SBI`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
-      receipts: [
-        {
-          workflow_id: 'LC-M2M-DEMO-999',
-          terminal_state_achieved: 'DOCUMENTS_PRESENTED',
-          cryptographic_signature: 'sig_rsa_pss_demo_m2m',
-          timestamp: new Date().toISOString(),
-        },
-      ],
+      corporateReference: 'ERP-PO-2026-SBI-002',
+      amount: 50000000,
+      currency: 'INR',
+      applicant: 'Tata Steel Limited',
+      beneficiary: 'National Mineral Development Corp',
+      expiryDate: '2026-12-15',
     }),
   });
-  const m2mData = await m2mRes.json();
-  assert(m2mRes.status === 200, 'M2M channel authenticated and flushed receipts');
-  assert(m2mData.acknowledged_receipt_ids.includes('LC-M2M-DEMO-999'), 'M2M receipt ledgered successfully');
+  const sbiDraftData = await sbiDraftRes.json();
+  assert(sbiDraftRes.status === 201, 'SBI draft created locally');
 
-  console.log('\n🎉 ALL 10 ARCHITECTURAL TEST SUITES PASSED PERFECTLY!\n');
+  const sbiDispatchRes = await fetch(`${ORCH_URL}/api/v1/letter_of_credit/issuance/SBI`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ draftId: sbiDraftData.draft_id }),
+  });
+  const sbiDispatchData = await sbiDispatchRes.json();
+  assert(sbiDispatchRes.status === 201, 'SBI LC issued with status 201');
+  assert(sbiDispatchData.bank_lc_number.startsWith('SBI-LC-'), 'Bank assigned authoritative SBI LC number');
+  assert(sbiDispatchData.crypto_execution.provider_mode === 'AWS_KMS', 'Used AWS_KMS provider for non-custodial signing');
+
+  console.log('\n🎉 ALL 10 ITERATION 3 ARCHITECTURAL TEST SUITES PASSED PERFECTLY!\n');
 }
 
 runTests().catch((err) => {

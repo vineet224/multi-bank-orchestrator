@@ -8,12 +8,14 @@ import crypto from 'crypto';
  * Architectural Purpose:
  * - Adapts canonical Letter of Credit schemas into HSBC ISO 20022 banking formats.
  * - Simulates the remote HSBC Trade Finance gateway with a real RSA-2048 keypair.
- * - Receives encrypted/signed client requests, verifies corporate identity,
- *   and responds with an encrypted & HSBC-signed confirmation receipt.
+ * - Real-World Banking Identifier Realism:
+ *   Neither the client nor the orchestrator generates the lcNumber!
+ *   The client sends an ERP corporateReference (SWIFT Field 20: Sender's Reference).
+ *   HSBC generates the authoritative lcNumber (SWIFT Field 27) upon issuance,
+ *   amendmentNumber upon amendment, and presentationNumber upon presentation.
  */
 export class HsbcBankAdapter {
   constructor() {
-    // Generate HSBC Bank RSA-2048 keypair for simulated remote gateway
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 2048,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -41,14 +43,19 @@ export class HsbcBankAdapter {
     return {
       messageDefinition: 'tsmt.019.001.03',
       hsbcFormatVersion: '2026.1',
+      operationType: canonicalContract.operationType || 'ISSUANCE',
       document: {
         letterOfCreditDetails: {
-          lcNumber: canonicalContract.lcNumber,
+          corporateReference: canonicalContract.corporateReference, // SWIFT Field 20
+          lcNumber: canonicalContract.lcNumber || null,             // SWIFT Field 27 (Bank generated on issuance)
           amount: canonicalContract.amount,
           currency: canonicalContract.currency || 'USD',
           applicantName: canonicalContract.applicant,
           beneficiaryName: canonicalContract.beneficiary,
           expiryDate: canonicalContract.expiryDate,
+          version: canonicalContract.version || 1,
+          amendmentDetails: canonicalContract.amendmentDetails || null,
+          documentManifest: canonicalContract.documentManifest || null,
         },
         routing: {
           swiftBic: 'HSBCINBBXXX',
@@ -61,18 +68,13 @@ export class HsbcBankAdapter {
   /**
    * Simulates remote HSBC bank gateway receiving encrypted/signed payload
    * @param {Object} request
-   * @param {Object} request.encryptedPayload - Envelope with encrypted DEK & ciphertext
-   * @param {string} request.clientSignature - Base64 RSA-SHA256 signature
-   * @param {string} request.clientPublicKeyPem
-   * @param {string} request.idempotencyKey
-   * @returns {Promise<{ encryptedResponse: Object, bankSignature: string, bankReference: string }>}
+   * @returns {Promise<{ encryptedResponse: Object, bankSignature: string, bankReference: string, bankResponse: Object }>}
    */
   async processBankRequest({ encryptedPayload, clientSignature, clientPublicKeyPem, idempotencyKey }) {
-    // 1. Financial Idempotency Check at Bank Gateway
     const isDuplicate = this.processedIdempotencyKeys.has(idempotencyKey);
     this.processedIdempotencyKeys.add(idempotencyKey);
 
-    // 2. Decrypt envelope using HSBC's private key (RSA-OAEP + AES-256-GCM)
+    // 1. Decrypt envelope using HSBC's private key (RSA-OAEP + AES-256-GCM)
     const dek = crypto.privateDecrypt(
       {
         key: this._bankPrivateKeyPem,
@@ -93,7 +95,7 @@ export class HsbcBankAdapter {
     decryptedRaw += decipher.final('utf8');
     const receivedPayload = JSON.parse(decryptedRaw);
 
-    // 3. Verify Client Signature using Client's Public Key
+    // 2. Verify Client Signature using Client's Public Key
     const payloadHash = crypto.createHash('sha256').update(decryptedRaw).digest();
     const verifier = crypto.createVerify('RSA-SHA256');
     verifier.update(payloadHash);
@@ -103,13 +105,34 @@ export class HsbcBankAdapter {
       throw new Error('HSBC Security Rejection: Client cryptographic signature verification failed');
     }
 
-    // 4. Construct Bank Response
+    const lcDetails = receivedPayload.document?.letterOfCreditDetails || {};
+    const operationType = receivedPayload.operationType || 'ISSUANCE';
+
+    // 3. Bank-Assigned Banking Identifiers
     const bankReference = `HSBC-TXN-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    let lcNumber = lcDetails.lcNumber;
+    let amendmentNumber = null;
+    let presentationNumber = null;
+
+    if (operationType === 'ISSUANCE' || !lcNumber) {
+      // In real-world banking: Bank assigns the official LC number
+      lcNumber = `HSBC-LC-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    } else if (operationType === 'AMENDMENT') {
+      amendmentNumber = `HSBC-AMD-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    } else if (operationType === 'PRESENTATION') {
+      presentationNumber = `HSBC-PRES-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    }
+
+    // 4. Construct Bank Response Payload
     const bankResponsePayload = {
       bank: 'HSBC',
       status: 'CONFIRMED_BY_HSBC',
       bankReference,
-      lcNumber: receivedPayload.document?.letterOfCreditDetails?.lcNumber,
+      corporateReference: lcDetails.corporateReference,
+      lcNumber,
+      amendmentNumber,
+      presentationNumber,
+      operationType,
       idempotencyKey,
       isReplay: isDuplicate,
       settlementNetwork: 'SWIFT_FIN',
@@ -151,6 +174,10 @@ export class HsbcBankAdapter {
       },
       bankSignature,
       bankReference,
+      lcNumber,
+      amendmentNumber,
+      presentationNumber,
+      bankResponse: bankResponsePayload,
     };
   }
 }

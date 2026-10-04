@@ -6,9 +6,11 @@ import crypto from 'crypto';
  * ============================================================================
  * 
  * Architectural Purpose:
- * - Adapts canonical Letter of Credit schemas into SBI Trade Finance REST JSON format.
- * - Simulates the remote SBI Trade Finance gateway with a real RSA-2048 keypair.
- * - Demonstrates multi-bank heterogeneous protocol translation.
+ * - Adapts canonical Letter of Credit schemas into SBI Trade Finance JSON REST schemas.
+ * - Simulates the remote SBI Trade Finance gateway with an independent RSA-2048 keypair.
+ * - Real-World Banking Identifiers:
+ *   Bank generates the official SBI lcNumber (Field 27) upon issuance,
+ *   amendmentNumber upon amendment, and presentationNumber upon presentation.
  */
 export class SbiBankAdapter {
   constructor() {
@@ -38,17 +40,22 @@ export class SbiBankAdapter {
   formatOutboundContract(canonicalContract) {
     return {
       protocol: 'SBI_TRADE_FINANCE_v2',
+      operationType: canonicalContract.operationType || 'ISSUANCE',
       sbiHeader: {
         channel: 'CORPORATE_DIRECT_CONNECT',
         timestamp: new Date().toISOString(),
       },
       lcApplication: {
-        refNo: canonicalContract.lcNumber,
+        corporateReference: canonicalContract.corporateReference, // SWIFT Field 20
+        refNo: canonicalContract.lcNumber || null,                // Bank-assigned LC number
         sanctionedAmount: canonicalContract.amount,
         ccy: canonicalContract.currency || 'INR',
         corporateParty: canonicalContract.applicant,
         supplierParty: canonicalContract.beneficiary,
         validityDate: canonicalContract.expiryDate,
+        version: canonicalContract.version || 1,
+        amendmentDetails: canonicalContract.amendmentDetails || null,
+        documentManifest: canonicalContract.documentManifest || null,
       },
     };
   }
@@ -56,7 +63,7 @@ export class SbiBankAdapter {
   /**
    * Simulates remote SBI bank gateway receiving encrypted/signed payload
    * @param {Object} request
-   * @returns {Promise<{ encryptedResponse: Object, bankSignature: string, bankReference: string }>}
+   * @returns {Promise<{ encryptedResponse: Object, bankSignature: string, bankReference: string, bankResponse: Object }>}
    */
   async processBankRequest({ encryptedPayload, clientSignature, clientPublicKeyPem, idempotencyKey }) {
     const isDuplicate = this.processedIdempotencyKeys.has(idempotencyKey);
@@ -93,13 +100,33 @@ export class SbiBankAdapter {
       throw new Error('SBI Security Rejection: Client cryptographic signature verification failed');
     }
 
-    // 3. Construct SBI Response
+    const lcApp = receivedPayload.lcApplication || {};
+    const operationType = receivedPayload.operationType || 'ISSUANCE';
+
+    // 3. Bank-Assigned Banking Identifiers
     const bankReference = `SBI-TXN-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    let lcNumber = lcApp.refNo;
+    let amendmentNumber = null;
+    let presentationNumber = null;
+
+    if (operationType === 'ISSUANCE' || !lcNumber) {
+      lcNumber = `SBI-LC-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    } else if (operationType === 'AMENDMENT') {
+      amendmentNumber = `SBI-AMD-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    } else if (operationType === 'PRESENTATION') {
+      presentationNumber = `SBI-PRES-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    }
+
+    // 4. Construct SBI Response
     const bankResponsePayload = {
       bank: 'SBI',
       status: 'CONFIRMED_BY_SBI',
       bankReference,
-      lcNumber: receivedPayload.lcApplication?.refNo,
+      corporateReference: lcApp.corporateReference,
+      lcNumber,
+      amendmentNumber,
+      presentationNumber,
+      operationType,
       idempotencyKey,
       isReplay: isDuplicate,
       clearingSystem: 'NEFT_RTGS_CORPORATE',
@@ -108,13 +135,13 @@ export class SbiBankAdapter {
 
     const responseRaw = JSON.stringify(bankResponsePayload);
 
-    // 4. Sign response using SBI Private Key
+    // 5. Sign response using SBI Private Key
     const signer = crypto.createSign('RSA-SHA256');
     signer.update(Buffer.from(responseRaw));
     signer.end();
     const bankSignature = signer.sign(this._bankPrivateKeyPem).toString('base64');
 
-    // 5. Encrypt response for client using Client's Public Key
+    // 6. Encrypt response for client using Client's Public Key
     const clientDek = crypto.randomBytes(32);
     const clientIv = crypto.randomBytes(12);
 
@@ -141,6 +168,10 @@ export class SbiBankAdapter {
       },
       bankSignature,
       bankReference,
+      lcNumber,
+      amendmentNumber,
+      presentationNumber,
+      bankResponse: bankResponsePayload,
     };
   }
 }

@@ -5,14 +5,15 @@ import crypto from 'crypto';
  * INTERVIEW RECALL: In-Memory Orchestrator Storage (inMemoryOrchestratorStore.js)
  * ============================================================================
  * 
- * ITERATION 1: Baseline Prototype
+ * ITERATION 3: Production-Grade Dual-Perimeter Architecture
  * 
  * Architectural Purpose:
- * - Manages Bank Credential Mappings (asymmetric public key binding) and 
- *   Letter of Credit (LC) multi-stage workflow instances without any external DB.
- * - Enforces zero private key storage (non-custodial cryptographic boundary).
- * - Manages an in-memory queue of pending completed workflow receipts to be
- *   piggybacked onto outbound Auth Service token inspection calls.
+ * 1. Bank Credential Mappings: Asymmetric public keys and KMS configs. Zero private keys.
+ * 2. Draft Storage: Multi-step offline/local draft saving for issuance, amendment, and presentation.
+ * 3. Workflow Instances: Two-step lifecycle tracking (DRAFT -> INITIATED -> DISPATCHED -> CONFIRMED).
+ * 4. Milestone Ledger: Replaces separate queue & background idle flusher!
+ *    Terminal state receipts are recorded with syncStatus: 'PENDING' | 'ACKNOWLEDGED'
+ *    and batch-synchronized during authoritative Auth hops or via on-demand /sync-billing.
  */
 
 /**
@@ -23,9 +24,10 @@ import crypto from 'crypto';
  * @typedef {Object} BankCredentialRecord
  * @property {string} clientId
  * @property {SupportedBankId} bankId
- * @property {string} clientPublicKey - PEM format (Corporate Public Key)
- * @property {string} bankPublicKey - PEM format (Bank Public Key)
- * @property {'AWS_KMS' | 'AZURE_VAULT' | 'REMOTE_API'} cryptoMode
+ * @property {string} clientPublicKey - PEM format
+ * @property {string} bankPublicKey - PEM format
+ * @property {'LOCAL_MOCK' | 'AWS_KMS' | 'AZURE_VAULT' | 'REMOTE_API'} cryptoMode
+ * @property {Object} [cryptoConfig]
  * @property {string} updatedAt
  */
 
@@ -38,22 +40,46 @@ import crypto from 'crypto';
  */
 
 /**
- * @typedef {Object} WorkflowInstanceRecord
- * @property {string} workflowId - Primary key (e.g. 'LC-1727889600000-a1b2c3')
- * @property {string} clientId - Foreign reference to client
+ * @typedef {Object} DraftRecord
+ * @property {string} draftId - e.g. 'DRAFT-LC-1727889600000-a1b2c3'
+ * @property {string} clientId - e.g. 'tata_steel'
  * @property {SupportedBankId} bankId
  * @property {'ISSUANCE' | 'AMENDMENT' | 'PRESENTATION'} type
- * @property {string} currentStage
- * @property {Object} genericContract - Canonical LC schema
- * @property {Array<WorkflowStageHistory>} history
+ * @property {string} corporateReference - ERP trade/PO reference
+ * @property {string} [lcNumber] - Assigned once issued by bank (required for amendment/presentation)
+ * @property {string} stage - Always 'DRAFT'
+ * @property {Object} payload - Canonical contract data, amendment details, or document manifest
+ * @property {string} createdAt
+ * @property {string} updatedAt
  */
 
 /**
- * @typedef {Object} BillingReceipt
- * @property {string} workflow_id
- * @property {string} terminal_state_achieved
- * @property {string} cryptographic_signature
+ * @typedef {Object} WorkflowInstanceRecord
+ * @property {string} workflowId - Internal workflow ID
+ * @property {string} clientId
+ * @property {SupportedBankId} bankId
+ * @property {'ISSUANCE' | 'AMENDMENT' | 'PRESENTATION'} type
+ * @property {string} corporateReference - Client's ERP reference (SWIFT Field 20)
+ * @property {string} [lcNumber] - Bank-issued LC number (SWIFT Field 27)
+ * @property {string} [amendmentNumber] - Bank-issued amendment number
+ * @property {string} [presentationNumber] - Bank-issued presentation number
+ * @property {string} currentStage
+ * @property {Object} genericContract - Canonical LC schema
+ * @property {Array<WorkflowStageHistory>} history
+ * @property {string} createdAt
+ * @property {string} updatedAt
+ */
+
+/**
+ * @typedef {Object} MilestoneReceiptRecord
+ * @property {string} receiptId
+ * @property {string} workflowId
+ * @property {string} corporateReference
+ * @property {string} terminalState
+ * @property {string} cryptographicSignature
  * @property {string} timestamp
+ * @property {'PENDING' | 'ACKNOWLEDGED'} syncStatus
+ * @property {string} [acknowledgedAt]
  */
 
 export class InMemoryOrchestratorStore {
@@ -61,22 +87,28 @@ export class InMemoryOrchestratorStore {
     /** @type {Map<string, BankCredentialRecord>} Key: `${clientId}:${bankId}` */
     this.bankCredentials = new Map();
 
+    /** @type {Map<string, DraftRecord>} Key: `draftId` */
+    this.drafts = new Map();
+
     /** @type {Map<string, WorkflowInstanceRecord>} Key: `workflowId` */
     this.workflows = new Map();
 
-    /** @type {Array<BillingReceipt>} Queue of completed receipts to piggyback to Auth Service */
-    this.pendingReceiptsQueue = [];
+    /** @type {Map<string, MilestoneReceiptRecord>} Key: `receiptId` */
+    this.milestoneReceipts = new Map();
 
-    // Pre-seed sample credentials & baseline LC for interview walkthrough
+    /** @type {number} Epoch ms of last successful sync with Auth Service */
+    this.lastSyncedAtEpoch = 0;
+
+    // Pre-seed baseline data for Tata Steel with HSBC and SBI
     this._seedInitialData();
   }
 
   /**
-   * Pre-seed baseline data for 'tata_steel' with HSBC and SBI
+   * Pre-seed baseline data for 'tata_steel'
    * @private
    */
   _seedInitialData() {
-    // 1. Pre-seed HSBC Credentials for tata_steel
+    // 1. HSBC Credentials for tata_steel
     this.saveBankCredentials({
       clientId: 'tata_steel',
       bankId: 'HSBC',
@@ -85,7 +117,7 @@ export class InMemoryOrchestratorStore {
       cryptoMode: 'AWS_KMS',
     });
 
-    // 2. Pre-seed SBI Credentials for tata_steel
+    // 2. SBI Credentials for tata_steel
     this.saveBankCredentials({
       clientId: 'tata_steel',
       bankId: 'SBI',
@@ -94,21 +126,26 @@ export class InMemoryOrchestratorStore {
       cryptoMode: 'AZURE_VAULT',
     });
 
-    // 3. Pre-seed Baseline Active LC for immediate testing
+    // 3. Pre-seed a baseline active workflow that has been confirmed by Bank
     const sampleWorkflowId = 'LC-SAMPLE-001';
+    const sampleLcNumber = 'HSBC-LC-2026-TATA-SAMPLE-01';
     this.saveWorkflow({
       workflowId: sampleWorkflowId,
       clientId: 'tata_steel',
       bankId: 'HSBC',
       type: 'ISSUANCE',
-      currentStage: 'LC_INITIATED',
+      corporateReference: 'ERP-PO-2026-0001',
+      lcNumber: sampleLcNumber,
+      currentStage: 'ISSUANCE_CONFIRMED',
       genericContract: {
-        lcNumber: 'LC/HSBC/2026/001',
+        corporateReference: 'ERP-PO-2026-0001',
+        lcNumber: sampleLcNumber,
         amount: 5000000,
         currency: 'USD',
         applicant: 'Tata Steel Limited',
         beneficiary: 'Global Iron Ore Supplier Ltd',
         expiryDate: '2026-12-31',
+        version: 1,
       },
       history: [
         {
@@ -117,14 +154,24 @@ export class InMemoryOrchestratorStore {
           trigger: 'SEED_INITIALIZER',
           metadata: { note: 'Pre-seeded sample for interview testing' },
         },
+        {
+          stage: 'ISSUANCE_CONFIRMED',
+          timestamp: new Date().toISOString(),
+          trigger: 'BANK_CONFIRMATION',
+          metadata: { lcNumber: sampleLcNumber },
+        },
       ],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     });
 
-    // 4. Pre-seed one completed receipt to demonstrate the first piggybacked billing hop
-    this.enqueueBillingReceipt({
+    // 4. Pre-seed one milestone receipt in PENDING state to demonstrate initial batch sync
+    this.recordMilestoneReceipt({
+      receiptId: 'RCPT-PREV-COMPLETED-999',
       workflow_id: 'LC-PREV-COMPLETED-999',
-      terminal_state_achieved: 'COMPLETED',
-      cryptographic_signature: 'sig_rsa_sha256_mock_7788',
+      corporate_reference: 'ERP-PO-2025-HISTORIC',
+      terminal_state_achieved: 'DOCUMENTS_PRESENTED',
+      cryptographic_signature: 'sig_rsa_pss_mock_receipt_7788',
       timestamp: new Date().toISOString(),
     });
   }
@@ -133,14 +180,7 @@ export class InMemoryOrchestratorStore {
   // BANK CREDENTIALS OPERATIONS
   // ==========================================================================
 
-  /**
-   * Save or update bank credential mapping
-   * Security guard: Strictly forbids any private key fields.
-   * @param {BankCredentialRecord} record
-   * @returns {BankCredentialRecord}
-   */
   saveBankCredentials(record) {
-    // Non-custodial check: never store private keys
     if (record.privateKey || record.secretKey || record.clientPrivateKey) {
       throw new Error('SECURITY VIOLATION: Private keys must never be stored in the orchestrator.');
     }
@@ -155,95 +195,166 @@ export class InMemoryOrchestratorStore {
     return { ...credential };
   }
 
-  /**
-   * Retrieve bank credentials by client and bank
-   * @param {string} clientId
-   * @param {SupportedBankId} bankId
-   * @returns {BankCredentialRecord | undefined}
-   */
   getBankCredentials(clientId, bankId) {
     return this.bankCredentials.get(`${clientId}:${bankId}`);
+  }
+
+  // ==========================================================================
+  // DRAFT OPERATIONS (Local, 0 Network Hops, Degraded Mode Safe)
+  // ==========================================================================
+
+  /**
+   * Saves or updates a draft record
+   * @param {Object} draftData
+   * @returns {DraftRecord}
+   */
+  saveDraft(draftData) {
+    const draftId = draftData.draftId || `DRAFT-LC-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const existing = this.drafts.get(draftId);
+    const now = new Date().toISOString();
+
+    const record = {
+      ...draftData,
+      draftId,
+      stage: 'DRAFT',
+      createdAt: existing ? existing.createdAt : now,
+      updatedAt: now,
+    };
+
+    this.drafts.set(draftId, record);
+    return { ...record };
+  }
+
+  /**
+   * Retrieves a draft by draftId
+   * @param {string} draftId
+   * @returns {DraftRecord | undefined}
+   */
+  getDraft(draftId) {
+    return this.drafts.get(draftId);
+  }
+
+  /**
+   * Deletes a draft (e.g. once promoted to active dispatch)
+   * @param {string} draftId
+   * @returns {boolean}
+   */
+  deleteDraft(draftId) {
+    return this.drafts.delete(draftId);
   }
 
   // ==========================================================================
   // WORKFLOW INSTANCE OPERATIONS
   // ==========================================================================
 
-  /**
-   * Save or update workflow instance
-   * @param {WorkflowInstanceRecord} workflowRecord
-   * @returns {WorkflowInstanceRecord}
-   */
   saveWorkflow(workflowRecord) {
-    this.workflows.set(workflowRecord.workflowId, { ...workflowRecord });
-    return this.workflows.get(workflowRecord.workflowId);
+    const now = new Date().toISOString();
+    const record = {
+      ...workflowRecord,
+      createdAt: workflowRecord.createdAt || now,
+      updatedAt: now,
+    };
+    this.workflows.set(record.workflowId, record);
+    return { ...record };
   }
 
-  /**
-   * Retrieve workflow instance by ID
-   * @param {string} workflowId
-   * @returns {WorkflowInstanceRecord | undefined}
-   */
   getWorkflow(workflowId) {
     return this.workflows.get(workflowId);
   }
 
+  findWorkflowByCorporateReference(clientId, corporateReference) {
+    for (const wf of this.workflows.values()) {
+      if (wf.clientId === clientId && wf.corporateReference === corporateReference) {
+        return wf;
+      }
+    }
+    return undefined;
+  }
+
+  findWorkflowByLcNumber(clientId, lcNumber) {
+    for (const wf of this.workflows.values()) {
+      if (wf.clientId === clientId && wf.lcNumber === lcNumber) {
+        return wf;
+      }
+    }
+    return undefined;
+  }
+
   // ==========================================================================
-  // PIGGYBACKED BILLING QUEUE OPERATIONS
+  // MILESTONE BILLING LEDGER (Replaces queue and flusher worker)
   // ==========================================================================
 
   /**
-   * Enqueue a completed workflow receipt to be piggybacked on the next auth hop
-   * @param {BillingReceipt} receipt
+   * Records a terminal milestone receipt in the ledger with syncStatus: 'PENDING'
+   * @param {Object} receiptParams
+   * @returns {MilestoneReceiptRecord}
    */
-  enqueueBillingReceipt(receipt) {
-    this.pendingReceiptsQueue.push({ ...receipt });
+  recordMilestoneReceipt(receiptParams) {
+    const receiptId = receiptParams.receiptId || `RCPT-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const record = {
+      receiptId,
+      workflow_id: receiptParams.workflow_id || receiptParams.workflowId,
+      corporate_reference: receiptParams.corporate_reference || receiptParams.corporateReference,
+      terminal_state_achieved: receiptParams.terminal_state_achieved || receiptParams.terminalState || 'DOCUMENTS_PRESENTED',
+      cryptographic_signature: receiptParams.cryptographic_signature || receiptParams.cryptographicSignature,
+      timestamp: receiptParams.timestamp || new Date().toISOString(),
+      syncStatus: 'PENDING',
+    };
+
+    this.milestoneReceipts.set(receiptId, record);
+    return { ...record };
   }
 
   /**
-   * Dequeue the next pending receipt to piggyback onto auth validation
-   * @returns {BillingReceipt | null}
+   * Retrieves all milestone receipts pending synchronization
+   * @returns {Array<MilestoneReceiptRecord>}
    */
-  dequeueNextBillingReceipt() {
-    return this.pendingReceiptsQueue.shift() || null;
+  getPendingMilestoneReceipts() {
+    const pending = [];
+    for (const r of this.milestoneReceipts.values()) {
+      if (r.syncStatus === 'PENDING') {
+        pending.push({ ...r });
+      }
+    }
+    return pending;
   }
 
   /**
-   * Peek next pending receipt without removing
-   * @returns {BillingReceipt | null}
+   * Acknowledges synchronized milestone receipts
+   * @param {Array<string>} acknowledgedIds - Workflow IDs or Receipt IDs
    */
-  peekNextBillingReceipt() {
-    return this.pendingReceiptsQueue[0] || null;
+  acknowledgeMilestoneReceipts(acknowledgedIds = []) {
+    if (!Array.isArray(acknowledgedIds) || acknowledgedIds.length === 0) return;
+
+    const idSet = new Set(acknowledgedIds);
+    const now = new Date().toISOString();
+
+    for (const receipt of this.milestoneReceipts.values()) {
+      if (idSet.has(receipt.receiptId) || idSet.has(receipt.workflow_id)) {
+        receipt.syncStatus = 'ACKNOWLEDGED';
+        receipt.acknowledgedAt = now;
+      }
+    }
+    this.lastSyncedAtEpoch = Date.now();
   }
 
   /**
-   * Removes an acknowledged receipt from the pending queue
-   * @param {string} workflowId
+   * Returns summary counts of milestone receipts
+   * @returns {{ total: number, pending: number, acknowledged: number }}
    */
-  acknowledgeReceipt(workflowId) {
-    this.pendingReceiptsQueue = this.pendingReceiptsQueue.filter(
-      (r) => r.workflow_id !== workflowId
-    );
-  }
-
-  /**
-   * Drains all pending receipts from the queue (used by background idle flusher)
-   * @returns {Array<BillingReceipt>}
-   */
-  drainPendingReceipts() {
-    const receipts = [...this.pendingReceiptsQueue];
-    this.pendingReceiptsQueue = [];
-    return receipts;
-  }
-
-  /**
-   * Get queue length
-   * @returns {number}
-   */
-  getPendingReceiptsCount() {
-    return this.pendingReceiptsQueue.length;
+  getMilestoneReceiptsCount() {
+    let pending = 0;
+    let acknowledged = 0;
+    for (const r of this.milestoneReceipts.values()) {
+      if (r.syncStatus === 'PENDING') pending++;
+      else if (r.syncStatus === 'ACKNOWLEDGED') acknowledged++;
+    }
+    return {
+      total: this.milestoneReceipts.size,
+      pending,
+      acknowledged,
+    };
   }
 }
 
 export const orchestratorStore = new InMemoryOrchestratorStore();
-

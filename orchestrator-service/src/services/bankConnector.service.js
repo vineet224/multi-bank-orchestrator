@@ -9,12 +9,14 @@ import { sbiAdapter } from './bankAdapters/sbiAdapter.js';
  * 
  * Architectural Purpose:
  * - Coordinates the complete end-to-end cryptographic and banking pipeline:
- *   1. Deterministic Idempotency Key generation (SWIFT/Stripe financial pattern).
+ *   1. Deterministic Idempotency Key: Uses corporateReference for issuance,
+ *      or bank lcNumber for amendment/presentation.
  *   2. Digest calculation (`SHA-256`) and non-custodial delegated signing (`signDigest`).
  *   3. In-process hybrid envelope encryption for target bank (`encryptForBank`).
  *   4. Dispatch to bank adapter (`HSBC` or `SBI`).
  *   5. In-process verification of bank signature (`verifyBankSignature`).
  *   6. Delegated decryption of bank response (`decryptPayload`).
+ *   7. Returns bank-assigned official lcNumber / amendmentNumber / presentationNumber.
  */
 export class BankConnectorService {
   constructor() {
@@ -40,14 +42,14 @@ export class BankConnectorService {
   /**
    * Generates a deterministic idempotency key for financial safety
    * @param {string} clientId
-   * @param {string} lcNumber
+   * @param {string} referenceKey - corporateReference or lcNumber
    * @param {number|string} [version=1]
    * @returns {string}
    */
-  generateIdempotencyKey(clientId, lcNumber, version = 1) {
+  generateIdempotencyKey(clientId, referenceKey, version = 1) {
     return crypto
       .createHash('sha256')
-      .update(`${clientId}:${lcNumber}:${version}`)
+      .update(`${clientId}:${referenceKey}:${version}`)
       .digest('hex');
   }
 
@@ -63,10 +65,11 @@ export class BankConnectorService {
   async dispatchToBank({ bankId, clientId, genericContract, cryptoProvider }) {
     const adapter = this.getAdapter(bankId);
 
-    // 1. Generate Deterministic Idempotency Key
+    // 1. Generate Deterministic Idempotency Key using corporateReference or lcNumber
+    const referenceKey = genericContract.corporateReference || genericContract.lcNumber || 'UNKNOWN_REF';
     const idempotencyKey = this.generateIdempotencyKey(
       clientId,
-      genericContract.lcNumber,
+      referenceKey,
       genericContract.version || 1
     );
 
@@ -98,7 +101,6 @@ export class BankConnectorService {
     const { encryptedResponse, bankSignature, bankReference } = bankResult;
 
     // 7. IN-PROCESS PUBLIC KEY OP: Decrypt & verify bank response
-    // First, decrypt response using client's private identity
     const decryptedRawResponse = await cryptoProvider.decryptPayload(encryptedResponse);
     const parsedBankResponse = JSON.parse(decryptedRawResponse);
 
@@ -117,6 +119,10 @@ export class BankConnectorService {
       success: true,
       bankId,
       bankReference,
+      lcNumber: parsedBankResponse.lcNumber,
+      amendmentNumber: parsedBankResponse.amendmentNumber,
+      presentationNumber: parsedBankResponse.presentationNumber,
+      corporateReference: parsedBankResponse.corporateReference,
       idempotencyKey,
       clientSignature,
       bankSignature,

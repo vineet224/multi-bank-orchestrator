@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { authStore } from '../storage/inMemoryAuthStore.js';
+import { sealToken, unsealToken } from '../crypto/sealedToken.js';
 
 /**
  * ============================================================================
@@ -7,11 +8,13 @@ import { authStore } from '../storage/inMemoryAuthStore.js';
  * ============================================================================
  * 
  * Execution Flow & Design Concepts:
- * 1. Opaque Token Pattern (RFC 6749):
- *    - Instead of stateless JWTs, we issue high-entropy 48-char random hex strings.
- *    - Allows instantaneous revocation (kill switch) without waiting for token expiry.
+ * 1. Sealed AEAD Opaque Token Pattern:
+ *    - Issues AES-256-GCM encrypted tokens prefixed with 'xlt_opq_'.
+ *    - Outside world sees an opaque token (zero claim leakage).
+ *    - Replicas in SaaS or on-prem can unseal locally for drafts (<0.1ms).
+ *    - Central store retains tokens for authoritative revocation kill-switches.
  * 2. Authoritative Inspection (RFC 7662 Token Introspection):
- *    - Orchestrator sends Bearer token + optional piggybacked billing receipt.
+ *    - Orchestrator sends Bearer token + optional batch piggybacked billing receipts.
  *    - Auth service validates token + subscription status and records billing atomically.
  * 3. Compact DTO Mapping:
  *    - Inline DTO transforms decouple storage representations from external API contracts.
@@ -50,6 +53,7 @@ const toIntrospectionResponseDTO = ({
   subscription = null,
   billingStatus = 'NOT_ATTACHED',
   acknowledgedReceiptId = null,
+  acknowledgedReceiptIds = [],
   capacityStatus = 'CAPACITY_OK',
   issuedAt = null,
   expiresInSeconds = 0,
@@ -66,7 +70,10 @@ const toIntrospectionResponseDTO = ({
     },
   }),
   billing_receipt_status: billingStatus,
-  acknowledged_receipt_id: acknowledgedReceiptId,
+  acknowledged_receipt_id: acknowledgedReceiptId || (acknowledgedReceiptIds[0] || null),
+  acknowledged_receipt_ids: acknowledgedReceiptIds.length > 0 
+    ? acknowledgedReceiptIds 
+    : (acknowledgedReceiptId ? [acknowledgedReceiptId] : []),
   ...(issuedAt && {
     session_metadata: {
       issued_at: issuedAt,
@@ -111,7 +118,7 @@ export const registerClient = (req, res) => {
 
 /**
  * POST /api/v1/auth/login
- * Authenticate client credentials and issue high-entropy opaque token
+ * Authenticate client credentials and issue sealed AEAD opaque token
  */
 export const login = (req, res) => {
   const { clientId, clientSecret } = req.body;
@@ -138,9 +145,9 @@ export const login = (req, res) => {
     });
   }
 
-  // Generate high-entropy opaque token (prefix + 48-char random hex = 24 bytes)
-  const token = `xlt_opq_${crypto.randomBytes(24).toString('hex')}`;
+  // Generate sealed AEAD opaque token
   const TTL_SECONDS = 3600;
+  const token = sealToken({ clientId, ttlSeconds: TTL_SECONDS });
 
   authStore.storeToken(token, { clientId, ttlSeconds: TTL_SECONDS });
 
@@ -152,6 +159,7 @@ export const login = (req, res) => {
  * Authoritative inspection endpoint (OAuth2 RFC 7662 style)
  * Headers: Authorization: Bearer <token>, X-Orchestrator-Node-Id: <nodeId>
  * Body: Optional { 
+ *   piggybacked_billing_receipts?: Array<BillingReceipt>,
  *   piggybacked_billing_receipt?: BillingReceipt,
  *   workflow_action?: 'INITIATE_WORKFLOW' | 'TERMINATE_WORKFLOW' | 'INSPECT'
  * }
@@ -159,7 +167,11 @@ export const login = (req, res) => {
 export const validateOpaqueToken = (req, res) => {
   const authHeader = req.headers['authorization'] || '';
   const orchestratorNodeId = req.headers['x-orchestrator-node-id'] || 'unknown-node';
-  const { piggybacked_billing_receipt, workflow_action = 'INSPECT' } = req.body || {};
+  const { 
+    piggybacked_billing_receipts, 
+    piggybacked_billing_receipt, 
+    workflow_action = 'INSPECT' 
+  } = req.body || {};
 
   // 1. Extract Bearer token
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
@@ -170,11 +182,26 @@ export const validateOpaqueToken = (req, res) => {
   }
 
   // 2. Validate token existence and TTL
-  const { exists, isExpired, tokenRecord } = authStore.getToken(token);
+  let { exists, isExpired, tokenRecord } = authStore.getToken(token);
+  
+  // If not found in central state (e.g. fresh cluster node), verify sealed AEAD structure
   if (!exists) {
-    return res.status(200).json(
-      toIntrospectionResponseDTO({ status: 'INVALID' })
-    );
+    const unsealed = unsealToken(token);
+    if (!unsealed.valid) {
+      return res.status(200).json(
+        toIntrospectionResponseDTO({ status: unsealed.error === 'EXPIRED' ? 'EXPIRED' : 'INVALID' })
+      );
+    }
+    // Token is cryptographically valid, populate virtual record
+    tokenRecord = {
+      token,
+      clientId: unsealed.clientId,
+      issuedAt: new Date(unsealed.issuedAt).toISOString(),
+      expiresAt: unsealed.expiresAt,
+      status: 'ACTIVE',
+    };
+    exists = true;
+    isExpired = false;
   }
 
   if (isExpired) {
@@ -197,16 +224,33 @@ export const validateOpaqueToken = (req, res) => {
     );
   }
 
-  // 4. Atomically persist piggybacked billing receipt if attached
+  // 4. Atomically persist piggybacked billing receipts (single or batch)
   let billingStatus = 'NOT_ATTACHED';
-  let acknowledgedReceiptId = null;
-  if (piggybacked_billing_receipt && piggybacked_billing_receipt.workflow_id) {
-    const recordResult = authStore.recordBilling({
-      ...piggybacked_billing_receipt,
-      orchestratorNodeId,
-    });
-    billingStatus = recordResult.already_recorded ? 'ALREADY_LEDGERED' : 'ACKNOWLEDGED_AND_LEDGERED';
-    acknowledgedReceiptId = recordResult.acknowledged_receipt_id;
+  const acknowledgedReceiptIds = [];
+
+  const receiptsToProcess = [];
+  if (Array.isArray(piggybacked_billing_receipts) && piggybacked_billing_receipts.length > 0) {
+    receiptsToProcess.push(...piggybacked_billing_receipts);
+  } else if (piggybacked_billing_receipt && (piggybacked_billing_receipt.workflow_id || piggybacked_billing_receipt.receiptId)) {
+    receiptsToProcess.push(piggybacked_billing_receipt);
+  }
+
+  if (receiptsToProcess.length > 0) {
+    let allAlreadyLedgered = true;
+    for (const r of receiptsToProcess) {
+      const recordResult = authStore.recordBilling({
+        ...r,
+        workflow_id: r.workflow_id || r.workflowId,
+        terminal_state_achieved: r.terminal_state_achieved || r.terminalState,
+        cryptographic_signature: r.cryptographic_signature || r.cryptographicSignature,
+        orchestratorNodeId,
+      });
+      if (!recordResult.already_recorded) {
+        allAlreadyLedgered = false;
+      }
+      acknowledgedReceiptIds.push(recordResult.acknowledged_receipt_id);
+    }
+    billingStatus = allAlreadyLedgered ? 'ALREADY_LEDGERED' : 'ACKNOWLEDGED_AND_LEDGERED';
   }
 
   // 5. Active Concurrent Capacity Licensing Check
@@ -222,7 +266,7 @@ export const validateOpaqueToken = (req, res) => {
           subscription: client.subscription,
           capacityStatus,
           billingStatus,
-          acknowledgedReceiptId,
+          acknowledgedReceiptIds,
           issuedAt: tokenRecord.issuedAt,
           expiresInSeconds: Math.round((tokenRecord.expiresAt - Date.now()) / 1000),
         })
@@ -242,7 +286,7 @@ export const validateOpaqueToken = (req, res) => {
       subscription: client.subscription,
       capacityStatus,
       billingStatus,
-      acknowledgedReceiptId,
+      acknowledgedReceiptIds,
       issuedAt: tokenRecord.issuedAt,
       expiresInSeconds: remainingSeconds,
     })
